@@ -1,5 +1,5 @@
 import { getColor } from '../../config/bot.js';
-import { SlashCommandBuilder, PermissionFlagsBits, ChannelType, EmbedBuilder, MessageFlags } from 'discord.js';
+import { SlashCommandBuilder, PermissionFlagsBits, ChannelType, EmbedBuilder } from 'discord.js';
 import { getWelcomeConfig, updateWelcomeConfig } from '../../utils/database.js';
 import { formatWelcomeMessage, truncateForEmbedField } from '../../utils/welcome.js';
 import { logger } from '../../utils/logger.js';
@@ -7,9 +7,191 @@ import { InteractionHelper } from '../../utils/interactionHelper.js';
 import { ErrorTypes, replyUserError } from '../../utils/errorHandler.js';
 import { inflateSync } from 'node:zlib';
 
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Mustache-style tag engine
+// Matches welcomer.gg/formatting: {{User.Mention}}, {{Ordinal(...)}}, {{#Section}}
+// ===========================================================================
+
+const DEFAULT_WELCOME_MESSAGE =
+    'Welcome {{User.Mention}} to **{{Guild.Name}}**! You are the {{Ordinal(Guild.Members)}} member!';
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+function toOrdinal(n) {
+    const num = Number(n);
+    if (!Number.isFinite(num)) return String(n);
+    const mod100 = Math.abs(num) % 100;
+    if (mod100 >= 11 && mod100 <= 13) return `${num}th`;
+    switch (Math.abs(num) % 10) {
+        case 1: return `${num}st`;
+        case 2: return `${num}nd`;
+        case 3: return `${num}rd`;
+        default: return `${num}th`;
+    }
+}
+
+function formatNumber(n, locale = 'default') {
+    const num = Number(n);
+    if (!Number.isFinite(num)) return String(n);
+    switch (locale) {
+        case 'dots': return num.toLocaleString('de-DE');
+        case 'commas': return num.toLocaleString('en-US');
+        case 'indian': return num.toLocaleString('en-IN');
+        case 'arabic': return num.toLocaleString('ar-EG');
+        default: return num.toLocaleString('en-US');
+    }
+}
+
+function formatTime(input, format = 'MMMM dd, yyyy') {
+    const date = input instanceof Date ? input : new Date(input);
+    if (Number.isNaN(date.getTime())) return String(input);
+
+    const pad = (value) => String(value).padStart(2, '0');
+    const tokens = {
+        yyyy: date.getFullYear(),
+        yy: String(date.getFullYear()).slice(-2),
+        MMMM: MONTHS[date.getMonth()],
+        MMM: MONTHS[date.getMonth()].slice(0, 3),
+        MM: pad(date.getMonth() + 1),
+        M: date.getMonth() + 1,
+        dddd: DAYS[date.getDay()],
+        ddd: DAYS[date.getDay()].slice(0, 3),
+        dd: pad(date.getDate()),
+        d: date.getDate(),
+        HH: pad(date.getHours()),
+        hh: pad(date.getHours() % 12 || 12),
+        h: date.getHours() % 12 || 12,
+        mm: pad(date.getMinutes()),
+        m: date.getMinutes(),
+        ss: pad(date.getSeconds()),
+        s: date.getSeconds()
+    };
+    return format.replace(/yyyy|yy|MMMM|MMM|MM|M|dddd|ddd|dd|d|HH|hh|h|mm|m|ss|s/g, (tag) => tokens[tag] ?? tag);
+}
+
+function sinceTime(input) {
+    const date = input instanceof Date ? input : new Date(input);
+    if (Number.isNaN(date.getTime())) return String(input);
+
+    const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+    const units = [
+        ['year', 31536000], ['month', 2592000], ['day', 86400],
+        ['hour', 3600], ['minute', 60], ['second', 1]
+    ];
+    for (const [name, size] of units) {
+        const value = Math.floor(seconds / size);
+        if (value >= 1) return `${value} ${name}${value === 1 ? '' : 's'}`;
+    }
+    return '0 seconds';
+}
+
+/** Builds the flat lookup used by both `{{Tag}}` and `{{Function(Tag)}}`. */
+function buildTagContext({ user, guild, member, invite }) {
+    const now = Date.now();
+    return {
+        'User.ID': user.id,
+        'User.Name': user.discriminator && user.discriminator !== '0'
+            ? `${user.globalName || user.username}#${user.discriminator}`
+            : (user.globalName || user.username),
+        'User.Username': user.username,
+        'User.Discriminator': user.discriminator || '0',
+        'User.GlobalName': user.globalName || user.username,
+        'User.Mention': `<@${user.id}>`,
+        'User.CreatedAt': sinceTime(user.createdTimestamp),
+        'User.JoinedAt': member?.joinedTimestamp ? sinceTime(member.joinedTimestamp) : 'unknown',
+        'User.LeftAt': 'unknown',
+        'User.Avatar': user.displayAvatarURL({ size: 256, extension: 'png' }),
+        'User.Bot': Boolean(user.bot),
+        'User.Pending': Boolean(member?.pending),
+
+        'Guild.ID': guild.id,
+        'Guild.Name': guild.name,
+        'Guild.Icon': guild.iconURL({ size: 256, extension: 'png' }) || '',
+        'Guild.Splash': guild.splashURL({ size: 512, extension: 'png' }) || '',
+        'Guild.Members': guild.memberCount,
+        'Guild.MembersJoined': now,
+        'Guild.Banner': guild.bannerURL({ size: 512, extension: 'png' }) || '',
+
+        'Invite.Code': invite?.code || 'unknown',
+        'Invite.Uses': invite?.uses ?? 0,
+        'Invite.Inviter': invite?.inviter?.tag || 'unknown',
+        'Invite.ChannelID': invite?.channelId || 'unknown',
+        'Invite.CreatedAt': invite?.createdTimestamp ? sinceTime(invite.createdTimestamp) : 'unknown',
+        'Invite.ExpiresAt': invite?.expiresTimestamp ? sinceTime(invite.expiresTimestamp) : 'never',
+        'Invite.MaxAge': invite?.maxAge ?? 0,
+        'Invite.MaxUses': invite?.maxUses ?? 0,
+        'Invite.Temporary': Boolean(invite?.temporary)
+    };
+}
+
+const FUNCTIONS = {
+    Ordinal: (value) => toOrdinal(value),
+    FormatNumber: (value, locale) => formatNumber(value, locale),
+    SinceTime: (value) => sinceTime(value),
+    FormatTime: (value, format) => formatTime(value, format),
+    Upper: (value) => String(value).toUpperCase(),
+    Lower: (value) => String(value).toLowerCase(),
+    Title: (value) => String(value).replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase())
+};
+
+const TAG_PATTERN = /\{\{([#/^]?)([\w.]+)(?:\(([^)]*)\))?(?:\/)?\}\}/g;
+const SECTION_PATTERN = /\{\{([#^])\/?([\w.]+)\}\}/g;
+
+/** Resolves one tag, applying a function call if the tag was wrapped in one. */
+function resolveTag(token, args, context, now) {
+    const [funcName, ...funcArgs] = args;
+    const raw = context[token];
+
+    // {{Guild.MembersJoined}} is a timestamp, so relative times stay relative.
+    const value = token === 'Guild.MembersJoined' && typeof raw === 'number'
+        ? sinceTime(raw)
+        : raw;
+
+    if (!funcName || !FUNCTIONS[funcName]) return value ?? '';
+    const resolvedArgs = funcArgs.map((arg) => (arg in context ? context[arg] : arg));
+    try {
+        return FUNCTIONS[funcName](value, ...resolvedArgs);
+    } catch {
+        return value ?? '';
+    }
+}
+
+/**
+ * Renders welcomer-style tags.
+ * @param {string} template
+ * @param {{user: import('discord.js').User, guild: import('discord.js').Guild, member?: import('discord.js').GuildMember, invite?: any}} data
+ * @param {number} now fixed timestamp so every tag in one render agrees
+ */
+function renderTags(template, data, now = Date.now()) {
+    if (typeof template !== 'string' || template.length === 0) return '';
+
+    const context = buildTagContext({ ...data, now });
+
+    // Mustache sections: {{#User.Bot}}yes{{/User.Bot}}{{^User.Bot}}no{{/User.Bot}}
+    let output = template.replace(
+        /\{\{([#^])([\w.]+)\}\}([\s\S]*?)\{\{\/\2\}\}/g,
+        (match, kind, tag, body) => {
+            const truthy = Boolean(resolveTag(tag, [], context, now));
+            return kind === '#' ? (truthy ? body : '') : (truthy ? '' : body);
+        }
+    );
+    // Strip any orphaned section markers left by a mismatched tag.
+    output = output.replace(SECTION_PATTERN, '');
+
+    return output.replace(TAG_PATTERN, (match, prefix, tag, args) => {
+        if (prefix) return '';
+        const parts = (args || '').split(',').map((p) => p.trim()).filter(Boolean);
+        const [token, ...rest] = parts;
+        if (!token) return '';
+        return String(resolveTag(token, rest, context, now));
+    });
+}
+
+// ===========================================================================
 // Accent color: profile banner color -> average of avatar -> role -> default
-// ---------------------------------------------------------------------------
+// ===========================================================================
 
 const DEFAULT_ACCENT = 0x5865f2;
 const avatarColorCache = new Map();
@@ -129,10 +311,6 @@ function toHex(color) {
     return `#${color.toString(16).padStart(6, '0')}`;
 }
 
-/**
- * Banner color if they have one, else the average of their avatar,
- * else their role color, else the fallback.
- */
 async function getMemberAccentColor(member, fallbackColor = DEFAULT_ACCENT) {
     const bannerColor = getBannerColor(member.user);
     if (bannerColor !== null) return bannerColor;
@@ -162,6 +340,12 @@ function accentSource(member) {
     return 'default';
 }
 
+export {
+    renderTags,
+    getMemberAccentColor,
+    DEFAULT_WELCOME_MESSAGE
+};
+
 export default {
     data: new SlashCommandBuilder()
         .setName('welcome')
@@ -178,8 +362,8 @@ export default {
                         .setRequired(true))
                 .addStringOption(option =>
                     option.setName('message')
-                        .setDescription('Welcome message. Variables: {user}, {username}, {server}, {memberCount}')
-                        .setRequired(true))
+                        .setDescription('Welcome message. Tags: {{User.Mention}}, {{Guild.Name}}, {{Ordinal(Guild.Members)}}, {{#User.Bot}}...{{/User.Bot}}')
+                        .setRequired(false))
                 .addStringOption(option =>
                     option.setName('image')
                         .setDescription('URL of the image to include in the welcome message')
@@ -187,6 +371,19 @@ export default {
                 .addBooleanOption(option =>
                     option.setName('ping')
                         .setDescription('Whether to ping the user in the welcome message')
+                        .setRequired(false)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('tags')
+                .setDescription('List every tag and function you can use'))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('test')
+                .setDescription('Preview the welcome message as it would be sent')
+                .addUserOption(option =>
+                    option
+                        .setName('user')
+                        .setDescription('Who to preview as. Defaults to you.')
                         .setRequired(false))),
 
     async execute(interaction) {
@@ -213,9 +410,99 @@ export default {
 
         const subcommand = options.getSubcommand();
 
+        // -------------------------------------------------------------------
+        // /welcome tags
+        // -------------------------------------------------------------------
+        if (subcommand === 'tags') {
+            const rows = [
+                ['**User**', ''],
+                ['`{{User.ID}}`', 'The user\'s id'],
+                ['`{{User.Name}}`', 'Global name or username with discriminator'],
+                ['`{{User.Username}}`', 'The user\'s username'],
+                ['`{{User.GlobalName}}`', 'The user\'s global name'],
+                ['`{{User.Discriminator}}`', 'The user\'s discriminator'],
+                ['`{{User.Mention}}`', 'Mentions the user'],
+                ['`{{User.CreatedAt}}`', 'Account age, relative'],
+                ['`{{User.JoinedAt}}`', 'Join date, relative'],
+                ['`{{User.Avatar}}`', 'Avatar URL'],
+                ['`{{User.Bot}}`', 'True if the user is a bot'],
+                ['`{{User.Pending}}``', 'True if pending membership screening'],
+                ['**Guild**', ''],
+                ['`{{Guild.ID}}`', 'The guild\'s id'],
+                ['`{{Guild.Name}}`', 'The guild\'s name'],
+                ['`{{Guild.Icon}}`', 'Guild icon URL'],
+                ['`{{Guild.Splash}}`', 'Guild splash URL'],
+                ['`{{Guild.Members}}`', 'Current member count'],
+                ['`{{Guild.MembersJoined}}`', 'Join counter (never decreases)'],
+                ['`{{Guild.Banner}}`', 'Guild banner URL'],
+                ['**Invite**', ''],
+                ['`{{Invite.Code}}`', 'The invite code'],
+                ['`{{Invite.Uses}}`', 'Times the invite was used'],
+                ['`{{Invite.Inviter}}`', 'Who created the invite'],
+                ['`{{Invite.CreatedAt}}`', 'Invite creation, relative'],
+                ['**Functions**', ''],
+                ['`{{Ordinal(Guild.Members)}}`', '1st, 2nd, 3rd, 4th…'],
+                ['`{{FormatNumber(n, commas)}}`', 'default, dots, commas, indian, arabic'],
+                ['`{{SinceTime(User.CreatedAt)}}`', '\"7 years\" as a string'],
+                ['`{{FormatTime(User.CreatedAt, MMMM dd, yyyy)}}`', 'Custom date format'],
+                ['`{{Upper(x)}}` / `{{Lower(x)}}` / `{{Title(x)}}`', 'Change case'],
+                ['**Sections**', ''],
+                ['`{{#User.Bot}}bot{{/User.Bot}}`', 'Show only if a bot'],
+                ['`{{^User.Bot}}human{{/User.Bot}}`', 'Show only if not a bot']
+            ];
+
+            const embed = new EmbedBuilder()
+                .setColor(getColor('primary'))
+                .setTitle('📝 Welcome tag reference')
+                .setDescription(rows
+                    .map(([name, desc]) => (desc ? `${name} — ${desc}` : `\n**${name.replace(/\*/g, '')}**`))
+                    .join('\n'))
+                .setFooter({ text: 'Example: ' + DEFAULT_WELCOME_MESSAGE });
+
+            return await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
+        }
+
+        // -------------------------------------------------------------------
+        // /welcome test
+        // -------------------------------------------------------------------
+        if (subcommand === 'test') {
+            const target = options.getUser('user') ?? interaction.user;
+            const member = await guild.members.fetch(target.id).catch(() => null);
+            if (!member) {
+                return await replyUserError(interaction, {
+                    type: ErrorTypes.UNKNOWN,
+                    message: 'That member is not in this server.'
+                });
+            }
+
+            const config = await getWelcomeConfig(client, guild.id);
+            const template = config?.welcomeMessage || DEFAULT_WELCOME_MESSAGE;
+            const invite = await guild.invites.fetch().then((i) => i.first()).catch(() => null);
+            const rendered = renderTags(template, { user: member.user, guild, member, invite });
+
+            const accentColor = await getMemberAccentColor(member, getColor('success'));
+
+            const embed = new EmbedBuilder()
+                .setColor(accentColor)
+                .setTitle('🎉 Preview')
+                .setDescription(truncateForEmbedField(rendered))
+                .setThumbnail(member.user.displayAvatarURL({ size: 256 }))
+                .setFooter({
+                    text: `Accent ${toHex(accentColor)} from their ${accentSource(member)} • ${config?.welcomePing ? 'pings' : 'no ping'}`
+                });
+
+            return await InteractionHelper.safeEditReply(interaction, {
+                content: config?.welcomePing ? `<@${member.id}>` : undefined,
+                embeds: [embed]
+            });
+        }
+
+        // -------------------------------------------------------------------
+        // /welcome setup
+        // -------------------------------------------------------------------
         if (subcommand === 'setup') {
             const channel = options.getChannel('channel');
-            const message = options.getString('message');
+            const message = options.getString('message') ?? DEFAULT_WELCOME_MESSAGE;
             const image = options.getString('image');
             const ping = options.getBoolean('ping') ?? false;
 
@@ -224,10 +511,21 @@ export default {
                 logger.info(`[Welcome] Setup blocked because config already exists in channel ${existingConfig.channelId} for guild ${guild.id}`);
                 return await replyUserError(interaction, { type: ErrorTypes.UNKNOWN, message: `Welcome is already configured for <#${existingConfig.channelId}>. Use **/greet dashboard** to customize channel, message, ping, or image.` });
             }
-            
-            if (!message || message.trim().length === 0) {
+
+            if (message.trim().length === 0) {
                 logger.warn(`[Welcome] Empty message provided by ${interaction.user.tag} in ${guild.name}`);
                 return await replyUserError(interaction, { type: ErrorTypes.VALIDATION, message: 'Welcome message cannot be empty' });
+            }
+
+            const unknownTags = [...message.matchAll(/\{\{([#/^]?)([\w.]+)/g)]
+                .map(([, , tag]) => tag)
+                .filter((tag) => !(tag in buildTagContext({ user: interaction.user, guild, member: null })));
+            if (unknownTags.length > 0) {
+                logger.warn(`[Welcome] Unknown tags in message by ${interaction.user.tag}: ${unknownTags.join(', ')}`);
+                return await replyUserError(interaction, {
+                    type: ErrorTypes.VALIDATION,
+                    message: `Unknown tag${unknownTags.length > 1 ? 's' : ''}: ${[...new Set(unknownTags)].map((t) => `\`{{${t}}}\``).join(', ')}. Run \`/welcome tags\` for the full list.`
+                });
             }
 
             if (image) {
@@ -250,13 +548,14 @@ export default {
 
                 logger.info(`[Welcome] Setup configured by ${interaction.user.tag} for guild ${guild.name} (${guild.id})`);
 
-                const previewMessage = formatWelcomeMessage(message, {
+                const previewMessage = renderTags(message, {
                     user: interaction.user,
-                    guild
+                    guild,
+                    member: guild.members.cache.get(interaction.user.id) ?? null
                 });
 
-                // Preview uses the admin's own banner/avatar color, so they see
-                // exactly what a new member's welcome will look like.
+                // Preview in the admin's own banner color, so they see what a
+                // new member's welcome will look like.
                 const previewMember = guild.members.cache.get(interaction.user.id);
                 const accentColor = previewMember
                     ? await getMemberAccentColor(previewMember, getColor('success'))
@@ -274,7 +573,7 @@ export default {
                         { name: 'Accent Color', value: `${toHex(accentColor)} (${accentFrom})`, inline: true },
                         { name: 'Status', value: 'Enabled' }
                     )
-                    .setFooter({ text: 'Tip: Use /greet dashboard to customize welcome settings' });
+                    .setFooter({ text: 'Tip: Run /welcome test to preview, /welcome tags for variables' });
 
                 if (image) {
                     embed.setImage(image);
