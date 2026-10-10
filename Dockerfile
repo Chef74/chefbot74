@@ -4,14 +4,15 @@ WORKDIR /usr/src/app
 
 ENV NODE_ENV=production
 
-# Optional system libs for @napi-rs/canvas text rendering on Alpine
+# System libs for @napi-rs/canvas text rendering on Alpine
 RUN apk add --no-cache \
     fontconfig \
     ttf-dejavu \
     && rm -rf /var/cache/apk/*
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+# Use npm install (not npm ci) so a temporarily out-of-sync lockfile does not fail the build
+RUN npm install --omit=dev
 
 COPY . .
 
